@@ -1,5 +1,5 @@
 name: gemini_live_interview
-description: Flutter + Gemini Live Streaming + On-Device Android ML Kit + Diarization & Summary
+description: Flutter + Gemini Live 60-Min Streaming + On-Device Android ML Kit + Diarization & Summary
 publish_to: 'none'
 version: 1.0.0+1
 
@@ -11,8 +11,6 @@ dependencies:
     sdk: flutter
   web_socket_channel: ^3.0.1
   record: ^7.1.2
-  flutter_pcm_sound: ^3.3.3
-  permission_handler: ^13.0.2
   http: ^1.2.2
 
 dev_dependencies:
