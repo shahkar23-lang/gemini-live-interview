@@ -5,9 +5,11 @@ import android.media.AudioFormat
 import android.media.AudioTrack
 import android.os.ParcelFileDescriptor
 import android.view.WindowManager
+import com.google.mlkit.genai.common.DownloadCallback
 import com.google.mlkit.genai.common.DownloadStatus
 import com.google.mlkit.genai.common.FeatureStatus
-import com.google.mlkit.genai.speechrecognition.AudioSource
+import com.google.mlkit.genai.common.GenAiException
+import com.google.mlkit.genai.common.audio.AudioSource
 import com.google.mlkit.genai.speechrecognition.SpeechRecognition
 import com.google.mlkit.genai.speechrecognition.SpeechRecognizer
 import com.google.mlkit.genai.speechrecognition.SpeechRecognizerOptions
@@ -265,7 +267,7 @@ class MainActivity : FlutterActivity() {
                             }
 
                             is SpeechRecognizerResponse.ErrorResponse -> {
-                                emitEvent("status", "ML Kit segment restarting (${response.error})...")
+                                emitEvent("status", "ML Kit segment restarting (${response.e.message})...")
                             }
 
                             else -> {}
@@ -308,6 +310,7 @@ class MainActivity : FlutterActivity() {
             .setInputType(InputType.CONVERSATION)
             .setOutputType(OutputType.THREE_BULLETS)
             .setLanguage(Language.ENGLISH)
+            .setLongInputAutoTruncationEnabled(true)
             .build()
 
         val client = Summarization.getClient(options)
@@ -327,7 +330,12 @@ class MainActivity : FlutterActivity() {
         if (status == FeatureStatus.DOWNLOADABLE) {
             emitEvent("status", "Downloading Gemini Nano Summarization model via AICore...")
             withContext(Dispatchers.IO) {
-                client.downloadFeature { }.await()
+                client.downloadFeature(object : DownloadCallback {
+                    override fun onDownloadStarted(bytesToDownload: Long) {}
+                    override fun onDownloadFailed(e: GenAiException) {}
+                    override fun onDownloadProgress(totalBytesDownloaded: Long) {}
+                    override fun onDownloadCompleted() {}
+                }).await()
             }
         }
 
