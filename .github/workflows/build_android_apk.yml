@@ -17,11 +17,13 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
+          cache: 'gradle'
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
+          cache: true
 
       - name: Generate Android Gradle wrapper & resources and overlay custom ML Kit code
         run: |
@@ -37,6 +39,7 @@ jobs:
           cp /tmp/backup/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
           mkdir -p android/app/src/main/kotlin/com/example/gemini_live_interview
           cp /tmp/backup/kotlin/*.kt android/app/src/main/kotlin/com/example/gemini_live_interview/
+          sed -i 's/compileSdk = flutter.compileSdkVersion/compileSdk = 37/g' android/app/build.gradle.kts
           sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 26/g' android/app/build.gradle.kts
           cat << 'EOF' >> android/app/build.gradle.kts
 
