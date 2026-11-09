@@ -3,12 +3,27 @@ import 'dart:convert';
 import 'dart:typed_data';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
+/// Supports continuous 60-minute Gemini Live sessions using:
+/// 1. `contextWindowCompression.slidingWindow` (removes the 15-minute audio token ceiling)
+/// 2. `sessionResumption` (`newHandle` caching + automatic transparent reconnection on `goAway` or socket rotation)
 class GeminiLiveService {
+  static const Duration maxSessionDuration = Duration(minutes: 60);
+
   WebSocketChannel? _channel;
   StreamSubscription? _wsSub;
   bool _isConnected = false;
+  bool _keepSessionAlive = false;
+
+  String? _apiKey;
+  String _model = 'models/gemini-2.5-flash';
+  String _voiceName = 'Aoede';
+  bool _aiCoInterviewerMode = true;
+  String? _resumptionHandle;
+  DateTime? _sessionStartedAt;
+  int _reconnectionCount = 0;
 
   bool get isConnected => _isConnected;
+  int get reconnectionCount => _reconnectionCount;
 
   final _pcmOutputController = StreamController<Uint8List>.broadcast();
   final _userTranscriptController = StreamController<String>.broadcast();
@@ -28,34 +43,61 @@ class GeminiLiveService {
     String voiceName = 'Aoede',
     bool aiCoInterviewerMode = true,
   }) async {
-    await disconnect();
+    _apiKey = apiKey;
+    _model = model;
+    _voiceName = voiceName;
+    _aiCoInterviewerMode = aiCoInterviewerMode;
+    _keepSessionAlive = true;
+    _resumptionHandle = null;
+    _reconnectionCount = 0;
+    _sessionStartedAt = DateTime.now();
+
+    await _openWebSocket(isResume: false);
+  }
+
+  Future<void> _openWebSocket({required bool isResume}) async {
+    await _closeSocketOnly();
+    if (!_keepSessionAlive || _apiKey == null) return;
 
     final uri = Uri.parse(
       'wss://generativelanguage.googleapis.com/ws/'
       'google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent'
-      '?key=$apiKey',
+      '?key=$_apiKey',
     );
 
-    _statusController.add('Connecting to Gemini Live...');
-    _channel = WebSocketChannel.connect(uri);
-    await _channel!.ready;
-    _isConnected = true;
+    _statusController.add(
+      isResume
+          ? 'Resuming 60-min Live session (#$_reconnectionCount)...'
+          : 'Connecting to Gemini Live (60-min sliding-window mode)...',
+    );
 
-    final systemPrompt = aiCoInterviewerMode
-        ? 'You are an expert technical co-interviewer listening to a live interview. '
+    try {
+      _channel = WebSocketChannel.connect(uri);
+      await _channel!.ready;
+      _isConnected = true;
+    } catch (e) {
+      _isConnected = false;
+      _statusController.add('Gemini Live connection error ($e). Retrying...');
+      _scheduleReconnectIfWithin60Min();
+      return;
+    }
+
+    final systemPrompt = _aiCoInterviewerMode
+        ? 'You are an expert technical co-interviewer in a 60-minute live interview. '
           'Keep spoken replies concise (1-2 sentences) and only chime in when addressed '
           'or asked for a follow-up question.'
-        : 'Listen quietly to the interview conversation without interrupting unless explicitly asked.';
+        : 'Listen quietly to the 60-minute interview conversation without interrupting unless explicitly asked.';
 
-    // 1. Send BidiGenerateContentSetup payload
+    // BidiGenerateContentSetup with contextWindowCompression (slidingWindow) + sessionResumption
+    // so the session runs continuously up to 60 minutes without hitting the 15-min ceiling.
     final setupPayload = {
       'setup': {
-        'model': model,
+        'model': _model,
         'generationConfig': {
           'responseModalities': ['AUDIO'],
           'speechConfig': {
             'voiceConfig': {
-              'prebuiltVoiceConfig': {'voiceName': voiceName},
+              'prebuiltVoiceConfig': {'voiceName': _voiceName},
             },
           },
         },
@@ -64,15 +106,19 @@ class GeminiLiveService {
             {'text': systemPrompt}
           ],
         },
+        'contextWindowCompression': {
+          'slidingWindow': {},
+        },
+        'sessionResumption': {
+          if (_resumptionHandle != null) 'handle': _resumptionHandle,
+        },
         'inputAudioTranscription': {},
         'outputAudioTranscription': {},
       },
     };
 
     _channel!.sink.add(jsonEncode(setupPayload));
-    _statusController.add('Gemini Live connected');
 
-    // 2. Listen to serverContent frames
     _wsSub = _channel!.stream.listen(
       (rawEvent) {
         final jsonStr = rawEvent is Uint8List ? utf8.decode(rawEvent) : rawEvent.toString();
@@ -81,44 +127,83 @@ class GeminiLiveService {
       },
       onError: (e) {
         _isConnected = false;
-        _statusController.add('Gemini Live error: $e');
+        _statusController.add('Live stream interrupted ($e) — auto-resuming...');
+        _scheduleReconnectIfWithin60Min();
       },
       onDone: () {
         _isConnected = false;
-        _statusController.add('Gemini Live session closed');
+        if (_keepSessionAlive) {
+          _scheduleReconnectIfWithin60Min();
+        } else {
+          _statusController.add('Gemini Live session closed');
+        }
       },
     );
   }
 
+  void _scheduleReconnectIfWithin60Min() {
+    if (!_keepSessionAlive || _sessionStartedAt == null) return;
+    final elapsed = DateTime.now().difference(_sessionStartedAt!);
+    if (elapsed >= maxSessionDuration) {
+      _keepSessionAlive = false;
+      _statusController.add('60-minute session limit reached.');
+      return;
+    }
+
+    _reconnectionCount++;
+    Future.delayed(const Duration(milliseconds: 450), () {
+      if (_keepSessionAlive) {
+        _openWebSocket(isResume: true);
+      }
+    });
+  }
+
   void _handleServerMessage(Map<String, dynamic> data) {
     if (data.containsKey('setupComplete')) {
-      _statusController.add('Live streaming active');
+      _statusController.add(
+        _reconnectionCount == 0
+            ? 'Live streaming active (60-min mode)'
+            : 'Live streaming active (resumed #$_reconnectionCount)',
+      );
+      return;
+    }
+
+    // Cache cryptographic session resumption handle for seamless 60-minute continuity
+    final resumptionUpdate = data['sessionResumptionUpdate'] as Map<String, dynamic>?;
+    if (resumptionUpdate != null) {
+      final newHandle = resumptionUpdate['newHandle'] as String?;
+      final resumable = resumptionUpdate['resumable'] as bool? ?? true;
+      if (resumable && newHandle != null && newHandle.isNotEmpty) {
+        _resumptionHandle = newHandle;
+      }
+    }
+
+    // Proactively rotate connection if server sends goAway before transport timeout (~10-15m)
+    if (data.containsKey('goAway') && _keepSessionAlive) {
+      _statusController.add('Rotating WebSocket transport for 60-min continuity...');
+      _scheduleReconnectIfWithin60Min();
       return;
     }
 
     final serverContent = data['serverContent'] as Map<String, dynamic>?;
     if (serverContent == null) return;
 
-    // Handle barge-in interruption (clear speaker buffer immediately)
     if (serverContent['interrupted'] == true) {
       _interruptedController.add(null);
     }
 
-    // Live transcription of human microphone input
     final inputTx = serverContent['inputTranscription'] as Map<String, dynamic>?;
     final userText = inputTx?['text'] as String?;
     if (userText != null && userText.trim().isNotEmpty) {
       _userTranscriptController.add(userText.trim());
     }
 
-    // Live transcription of Gemini spoken output
     final outputTx = serverContent['outputTranscription'] as Map<String, dynamic>?;
     final modelTxText = outputTx?['text'] as String?;
     if (modelTxText != null && modelTxText.trim().isNotEmpty) {
       _modelTranscriptController.add(modelTxText.trim());
     }
 
-    // 24kHz 16-bit PCM audio bytes from Gemini
     final modelTurn = serverContent['modelTurn'] as Map<String, dynamic>?;
     final parts = modelTurn?['parts'] as List<dynamic>?;
     if (parts != null) {
@@ -137,7 +222,6 @@ class GeminiLiveService {
     }
   }
 
-  /// Stream 16kHz 16-bit little-endian mono PCM chunk to Gemini Live
   void sendAudioChunk16k(Uint8List pcmBytes) {
     if (!_isConnected || _channel == null) return;
     final payload = {
@@ -153,7 +237,6 @@ class GeminiLiveService {
     _channel!.sink.add(jsonEncode(payload));
   }
 
-  /// Send an explicit text prompt into the active Live session (e.g. "Suggest next question")
   void sendTextPrompt(String text) {
     if (!_isConnected || _channel == null) return;
     final payload = {
@@ -172,12 +255,17 @@ class GeminiLiveService {
     _channel!.sink.add(jsonEncode(payload));
   }
 
-  Future<void> disconnect() async {
+  Future<void> _closeSocketOnly() async {
     _isConnected = false;
     await _wsSub?.cancel();
     _wsSub = null;
     await _channel?.sink.close();
     _channel = null;
+  }
+
+  Future<void> disconnect() async {
+    _keepSessionAlive = false;
+    await _closeSocketOnly();
   }
 
   void dispose() {
