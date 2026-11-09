@@ -50,6 +50,16 @@ class MlKitNativeBridge {
     await _method.invokeMethod('feedPcmChunk', {'pcm': pcm16kMono});
   }
 
+  Future<void> playModelPcm24k(Uint8List pcm24kMono) async {
+    if (!Platform.isAndroid) return;
+    await _method.invokeMethod('playModelPcm24k', {'pcm': pcm24kMono});
+  }
+
+  Future<void> clearModelAudio() async {
+    if (!Platform.isAndroid) return;
+    await _method.invokeMethod('clearModelAudio');
+  }
+
   Future<void> stopOnDeviceStt() async {
     if (!Platform.isAndroid) return;
     await _method.invokeMethod('stopOnDeviceStt');
