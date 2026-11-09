@@ -3,11 +3,12 @@ import 'dart:io';
 import 'package:flutter/services.dart';
 
 class MlKitEvent {
-  final String type; // 'transcript' | 'status' | 'error'
+  final String type; // 'transcript' | 'rms' | 'status' | 'error'
   final String? text;
   final String? speaker;
   final bool isFinal;
   final String? message;
+  final double? rmsdB;
 
   MlKitEvent({
     required this.type,
@@ -15,6 +16,7 @@ class MlKitEvent {
     this.speaker,
     this.isFinal = false,
     this.message,
+    this.rmsdB,
   });
 
   factory MlKitEvent.fromMap(Map<dynamic, dynamic> map) {
@@ -24,6 +26,7 @@ class MlKitEvent {
       speaker: map['speaker'] as String?,
       isFinal: map['isFinal'] as bool? ?? false,
       message: map['message'] as String?,
+      rmsdB: (map['rmsdB'] as num?)?.toDouble(),
     );
   }
 }
@@ -40,9 +43,15 @@ class MlKitNativeBridge {
         .map((e) => MlKitEvent.fromMap(e as Map));
   }
 
-  Future<void> startOnDeviceStt() async {
+  Future<bool> ensureMicPermission() async {
+    if (!Platform.isAndroid) return true;
+    final granted = await _method.invokeMethod<bool>('ensureMicPermission');
+    return granted ?? false;
+  }
+
+  Future<void> startOnDeviceStt({bool usePfdPipe = false}) async {
     if (!Platform.isAndroid) return;
-    await _method.invokeMethod('startOnDeviceStt');
+    await _method.invokeMethod('startOnDeviceStt', {'usePfdPipe': usePfdPipe});
   }
 
   Future<void> feedPcmChunk(Uint8List pcm16kMono) async {
