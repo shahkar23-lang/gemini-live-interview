@@ -2,26 +2,31 @@ package com.example.gemini_live_interview
 
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import kotlin.math.abs
 import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.sqrt
 
 /**
- * Lightweight on-device acoustic speaker diarizer for 16kHz 16-bit mono PCM streams.
- * Extracts normalized voice embeddings (pitch F0, ZCR, low/high band energy ratio, RMS dynamics)
- * over voiced frames and clusters speakers online via cosine similarity.
+ * Real-time on-device speaker diarizer supporting both:
+ * 1) Raw 16kHz 16-bit PCM chunks (pitch F0, ZCR, spectral ratio, RMS energy)
+ * 2) Android SpeechRecognizer RMS + cadence/turn-gap dynamics
  */
 class SpeakerDiarizer(
     private val sampleRate: Int = 16000,
-    private val maxSpeakers: Int = 4,
-    private val similarityThreshold: Double = 0.90
+    private val maxSpeakers: Int = 2,
+    private val similarityThreshold: Double = 0.88
 ) {
     private val speakerCentroids = mutableListOf<DoubleArray>()
     private val speakerCounts = mutableListOf<Int>()
     private val currentUtteranceVectors = mutableListOf<DoubleArray>()
+    private val currentRmsValues = mutableListOf<Double>()
+
+    private var lastUtteranceEndMs: Long = 0L
+    private var currentSpeakerIndex: Int = 0
 
     @Volatile
-    var activeSpeakerLabel: String = "Speaker 1"
+    var activeSpeakerLabel: String = "Speaker 1 (Journalist)"
         private set
 
     fun reset() {
@@ -29,25 +34,43 @@ class SpeakerDiarizer(
             speakerCentroids.clear()
             speakerCounts.clear()
             currentUtteranceVectors.clear()
-            activeSpeakerLabel = "Speaker 1"
+            currentRmsValues.clear()
+            lastUtteranceEndMs = 0L
+            currentSpeakerIndex = 0
+            activeSpeakerLabel = formatSpeaker(0)
+        }
+    }
+
+    private fun formatSpeaker(index: Int): String {
+        return when (index) {
+            0 -> "Speaker 1 (Journalist)"
+            1 -> "Speaker 2 (Interviewee)"
+            else -> "Speaker ${index + 1}"
+        }
+    }
+
+    /** Feed RMS dB frame from Android SpeechRecognizer.onRmsChanged */
+    fun processRmsFrame(rmsdB: Float) {
+        if (rmsdB < 1.5f) return
+        synchronized(this) {
+            currentRmsValues.add(rmsdB.toDouble())
         }
     }
 
     /** Feed raw 16-bit little-endian PCM bytes at 16kHz. */
     fun processPcmChunk(pcmBytes: ByteArray) {
-        if (pcmBytes.size < 640) return // Minimum 20ms at 16kHz
+        if (pcmBytes.size < 640) return
         val shortCount = pcmBytes.size / 2
         val samples = ShortArray(shortCount)
         ByteBuffer.wrap(pcmBytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(samples)
 
-        // Compute RMS to check Voice Activity (VAD)
         var sumSq = 0.0
         for (s in samples) {
             val norm = s / 32768.0
             sumSq += norm * norm
         }
         val rms = sqrt(sumSq / shortCount)
-        if (rms < 0.015) return // Ignore silence / background noise
+        if (rms < 0.015) return
 
         val features = extractVoiceEmbedding(samples, rms)
         synchronized(this) {
@@ -58,21 +81,65 @@ class SpeakerDiarizer(
         }
     }
 
-    /** Finalize speaker assignment at the end of a recognized phrase and clear utterance buffer. */
+    /** Finalize speaker assignment at the end of a recognized utterance. */
     fun finalizeUtteranceSpeaker(): String {
         synchronized(this) {
+            val now = System.currentTimeMillis()
+            val gapMs = if (lastUtteranceEndMs > 0L) (now - lastUtteranceEndMs) else 0L
+            lastUtteranceEndMs = now
+
             if (currentUtteranceVectors.isNotEmpty()) {
                 val avg = averageVectors(currentUtteranceVectors)
                 activeSpeakerLabel = assignOrUpdateCluster(avg)
                 currentUtteranceVectors.clear()
+                currentRmsValues.clear()
+                return activeSpeakerLabel
             }
+
+            // When using Android SpeechRecognizer RMS stream, combine vocal energy profile + conversational turn gap
+            if (currentRmsValues.isNotEmpty()) {
+                val meanRms = currentRmsValues.average()
+                var variance = 0.0
+                for (r in currentRmsValues) {
+                    variance += (r - meanRms) * (r - meanRms)
+                }
+                val stdRms = sqrt(variance / currentRmsValues.size)
+                val pseudoEmbedding = l2Normalize(
+                    doubleArrayOf(
+                        meanRms / 12.0,
+                        stdRms / 5.0,
+                        ln(currentRmsValues.size.toDouble() + 1.0) * 0.3,
+                        1.0
+                    )
+                )
+                currentRmsValues.clear()
+
+                // If there was a natural conversational pause (> 1400ms) and energy profile shifted, switch speaker
+                if (gapMs > 1400L && speakerCentroids.isNotEmpty()) {
+                    val prevCentroid = speakerCentroids[currentSpeakerIndex]
+                    val sim = cosineSimilarity(pseudoEmbedding, prevCentroid)
+                    if (sim < 0.96) {
+                        currentSpeakerIndex = (currentSpeakerIndex + 1) % maxSpeakers
+                    }
+                }
+                if (speakerCentroids.size <= currentSpeakerIndex) {
+                    speakerCentroids.add(pseudoEmbedding)
+                    speakerCounts.add(1)
+                } else {
+                    speakerCentroids[currentSpeakerIndex] = pseudoEmbedding
+                }
+                activeSpeakerLabel = formatSpeaker(currentSpeakerIndex)
+            } else if (gapMs > 2200L) {
+                currentSpeakerIndex = (currentSpeakerIndex + 1) % maxSpeakers
+                activeSpeakerLabel = formatSpeaker(currentSpeakerIndex)
+            }
+
             return activeSpeakerLabel
         }
     }
 
     private fun extractVoiceEmbedding(samples: ShortArray, rms: Double): DoubleArray {
         val n = samples.size
-        // 1. Zero-Crossing Rate (correlates with fricatives & vocal tract timbre)
         var zeroCrossings = 0
         for (i in 1 until n) {
             if ((samples[i - 1] >= 0 && samples[i] < 0) || (samples[i - 1] < 0 && samples[i] >= 0)) {
@@ -81,7 +148,6 @@ class SpeakerDiarizer(
         }
         val zcr = zeroCrossings.toDouble() / n
 
-        // 2. Fundamental Pitch (F0) via time-domain autocorrelation (75 Hz - 350 Hz)
         val minLag = sampleRate / 350
         val maxLag = minOf(sampleRate / 75, n / 2)
         var bestLag = minLag
@@ -100,9 +166,8 @@ class SpeakerDiarizer(
             }
         }
         val pitchHz = sampleRate.toDouble() / max(bestLag, 1)
-        val normPitch = (pitchHz - 75.0) / 275.0 // Normalized ~[0, 1]
+        val normPitch = (pitchHz - 75.0) / 275.0
 
-        // 3. First-difference high-frequency vs low-frequency energy balance (spectral tilt)
         var diffEnergy = 0.0
         var lowPassEnergy = 0.0
         var prev = samples[0] / 32768.0
@@ -130,7 +195,8 @@ class SpeakerDiarizer(
         if (speakerCentroids.isEmpty()) {
             speakerCentroids.add(embedding)
             speakerCounts.add(1)
-            return "Speaker 1"
+            currentSpeakerIndex = 0
+            return formatSpeaker(0)
         }
 
         var bestIdx = 0
@@ -151,11 +217,13 @@ class SpeakerDiarizer(
             }
             speakerCentroids[bestIdx] = l2Normalize(updated)
             speakerCounts[bestIdx] = count
-            "Speaker ${bestIdx + 1}"
+            currentSpeakerIndex = bestIdx
+            formatSpeaker(bestIdx)
         } else {
             speakerCentroids.add(embedding)
             speakerCounts.add(1)
-            "Speaker ${speakerCentroids.size}"
+            currentSpeakerIndex = speakerCentroids.size - 1
+            formatSpeaker(currentSpeakerIndex)
         }
     }
 
