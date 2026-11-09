@@ -317,11 +317,6 @@ class MainActivity : FlutterActivity() {
                                 }
                             }
 
-                            is SpeechRecognizerResponse.AudioLevelResponse -> {
-                                diarizer.processRmsFrame(response.rmsdB)
-                                emitRms(response.rmsdB)
-                            }
-
                             is SpeechRecognizerResponse.ErrorResponse -> {
                                 emitEvent("status", "Reconnecting speech segment (${response.e.message})...")
                             }
