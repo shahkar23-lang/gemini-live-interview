@@ -169,7 +169,7 @@ class _InterviewHomePageState extends State<InterviewHomePage> {
 
     // 5. Handle barge-in interruption
     _geminiLive.onInterrupted.listen((_) async {
-      await FlutterPcmSound.clear();
+      await FlutterPcmSound.setup(sampleRate: 24000, channelCount: 1);
     });
 
     _geminiLive.statusStream.listen((s) {
@@ -207,7 +207,6 @@ class _InterviewHomePageState extends State<InterviewHomePage> {
     }
 
     await _mlKitBridge.startOnDeviceStt();
-    await FlutterPcmSound.play();
 
     // Start single 16kHz 16-bit mono PCM mic capture and tee to BOTH Gemini Live & ML Kit PFD pipe
     const config = RecordConfig(
