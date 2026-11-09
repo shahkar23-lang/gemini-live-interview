@@ -3,6 +3,7 @@ class TranscriptEntry {
   String speaker;
   final String text;
   final DateTime timestamp;
+  final Duration sessionOffset;
   final bool isFromGeminiModel;
   final bool isOnDeviceMlKit;
 
@@ -11,25 +12,24 @@ class TranscriptEntry {
     required this.speaker,
     required this.text,
     required this.timestamp,
+    this.sessionOffset = Duration.zero,
     this.isFromGeminiModel = false,
     this.isOnDeviceMlKit = false,
   });
 }
 
 class InterviewSummaryResult {
-  final String? onDeviceBullets;
-  final String executiveSummary;
+  final List<String> summaryBullets;
+  final List<String> journalistCounterQuestions;
   final Map<String, String> speakerRoles;
-  final List<String> keyStrengths;
-  final List<String> followUpQuestions;
-  final String hiringRecommendation;
+  final String keyHeadline;
+  final String sourceLabel;
 
   const InterviewSummaryResult({
-    this.onDeviceBullets,
-    required this.executiveSummary,
-    required this.speakerRoles,
-    required this.keyStrengths,
-    required this.followUpQuestions,
-    required this.hiringRecommendation,
+    required this.summaryBullets,
+    required this.journalistCounterQuestions,
+    this.speakerRoles = const {},
+    required this.keyHeadline,
+    required this.sourceLabel,
   });
 }
