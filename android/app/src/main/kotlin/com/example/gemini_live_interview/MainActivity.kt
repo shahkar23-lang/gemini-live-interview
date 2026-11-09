@@ -1,10 +1,21 @@
 package com.example.gemini_live_interview
 
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer as AndroidSpeechRecognizer
 import android.view.WindowManager
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import com.google.mlkit.genai.common.DownloadCallback
 import com.google.mlkit.genai.common.DownloadStatus
 import com.google.mlkit.genai.common.FeatureStatus
@@ -45,15 +56,19 @@ class MainActivity : FlutterActivity() {
         private const val METHOD_CHANNEL = "com.interview.ai/mlkit"
         private const val EVENT_CHANNEL = "com.interview.ai/mlkit_stream"
         private const val GEMINI_OUTPUT_SAMPLE_RATE = 24000
+        private const val REQ_RECORD_AUDIO = 901
     }
 
     private val mainScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private val mainHandler = Handler(Looper.getMainLooper())
     private val diarizer = SpeakerDiarizer()
 
     private var eventSink: EventChannel.EventSink? = null
     private var speechRecognizer: SpeechRecognizer? = null
+    private var androidSpeechRecognizer: AndroidSpeechRecognizer? = null
     private var summarizer: Summarizer? = null
     private var recognitionJob: Job? = null
+    private var pendingPermResult: MethodChannel.Result? = null
 
     @Volatile
     private var keepSttRunning: Boolean = false
@@ -81,16 +96,33 @@ class MainActivity : FlutterActivity() {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, METHOD_CHANNEL)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
-                    "startOnDeviceStt" -> {
-                        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                        mainScope.launch {
-                            try {
-                                startMlKitStreamingStt()
-                                result.success(true)
-                            } catch (e: Exception) {
-                                result.error("MLKIT_STT_ERR", e.message, null)
-                            }
+                    "ensureMicPermission" -> {
+                        val granted = ContextCompat.checkSelfPermission(
+                            this,
+                            Manifest.permission.RECORD_AUDIO
+                        ) == PackageManager.PERMISSION_GRANTED
+                        if (granted) {
+                            result.success(true)
+                        } else {
+                            pendingPermResult = result
+                            ActivityCompat.requestPermissions(
+                                this,
+                                arrayOf(Manifest.permission.RECORD_AUDIO),
+                                REQ_RECORD_AUDIO
+                            )
                         }
+                    }
+
+                    "startOnDeviceStt" -> {
+                        val usePfdPipe = call.argument<Boolean>("usePfdPipe") ?: false
+                        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                        // Return immediately so UI never blocks, and launch continuous STT
+                        keepSttRunning = true
+                        diarizer.reset()
+                        mainScope.launch {
+                            startContinuousSttEngine(usePfdPipe)
+                        }
+                        result.success(true)
                     }
 
                     "feedPcmChunk" -> {
@@ -103,9 +135,7 @@ class MainActivity : FlutterActivity() {
                                     try {
                                         out.write(bytes)
                                         out.flush()
-                                    } catch (_: Exception) {
-                                        // Pipe rotates cleanly across 60-minute segments
-                                    }
+                                    } catch (_: Exception) {}
                                 }
                             }
                         }
@@ -138,7 +168,7 @@ class MainActivity : FlutterActivity() {
 
                     "stopOnDeviceStt" -> {
                         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                        stopMlKitStreamingStt()
+                        stopAllSttEngines()
                         result.success(true)
                     }
 
@@ -162,6 +192,20 @@ class MainActivity : FlutterActivity() {
                     else -> result.notImplemented()
                 }
             }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQ_RECORD_AUDIO) {
+            val granted = grantResults.isNotEmpty() &&
+                grantResults[0] == PackageManager.PERMISSION_GRANTED
+            pendingPermResult?.success(granted)
+            pendingPermResult = null
+        }
     }
 
     private fun initAudioTrack24k() {
@@ -191,58 +235,65 @@ class MainActivity : FlutterActivity() {
         audioTrack?.play()
     }
 
-    private suspend fun startMlKitStreamingStt() {
-        stopMlKitStreamingStt()
-        diarizer.reset()
-        keepSttRunning = true
+    /**
+     * Checks if ML Kit GenAI Speech Recognition is already available on-device.
+     * If available, runs ML Kit GenAI SpeechRecognition; otherwise immediately starts
+     * Android's universal SpeechRecognizer in a continuous 60-minute hands-free loop.
+     */
+    private suspend fun startContinuousSttEngine(usePfdPipe: Boolean) {
+        stopRecognitionEnginesOnly()
 
-        // Try MODE_ADVANCED (Gemini Nano / AICore) and fall back to MODE_BASIC if unsupported
-        var recognizer = SpeechRecognition.getClient(
-            speechRecognizerOptions {
-                locale = Locale.US
-                preferredMode = SpeechRecognizerOptions.Mode.MODE_ADVANCED
-            }
-        )
-
-        var status = recognizer.checkStatus()
-        if (status == FeatureStatus.UNAVAILABLE) {
-            recognizer.close()
+        var mlKitReady = false
+        var recognizer: SpeechRecognizer? = null
+        try {
             recognizer = SpeechRecognition.getClient(
                 speechRecognizerOptions {
-                    locale = Locale.US
+                    locale = Locale.getDefault()
                     preferredMode = SpeechRecognizerOptions.Mode.MODE_BASIC
                 }
             )
-            status = recognizer.checkStatus()
-        }
-
-        if (status == FeatureStatus.DOWNLOADABLE) {
-            emitEvent("status", "Downloading on-device ML Kit Speech model...")
-            recognizer.download().collect { dl ->
-                if (dl is DownloadStatus.DownloadCompleted) {
-                    emitEvent("status", "ML Kit Speech model ready (60-min mode active).")
-                }
+            val status = recognizer.checkStatus()
+            if (status == FeatureStatus.AVAILABLE) {
+                mlKitReady = true
+            } else {
+                recognizer.close()
+                recognizer = null
             }
-        } else if (status == FeatureStatus.UNAVAILABLE) {
-            emitEvent("status", "ML Kit Speech unavailable on this device; acoustic diarizer + Gemini Live active.")
-            speechRecognizer = recognizer
-            return
+        } catch (_: Exception) {
+            try {
+                recognizer?.close()
+            } catch (_: Exception) {}
+            recognizer = null
         }
 
-        speechRecognizer = recognizer
+        if (mlKitReady && recognizer != null) {
+            speechRecognizer = recognizer
+            emitEvent("status", "LIVE: On-Device ML Kit GenAI Speech active (Hands-Free 60m)")
+            startMlKitLoop(recognizer, usePfdPipe)
+        } else if (!usePfdPipe) {
+            emitEvent("status", "LIVE: Android On-Device Speech Engine active (Hands-Free 60m)")
+            startAndroidSpeechRecognizerLoop()
+        } else {
+            emitEvent("status", "LIVE: Gemini Live Audio Stream + Acoustic Diarizer active (Hands-Free 60m)")
+        }
+    }
 
-        // Continuous recognition loop supporting up to 60-minute sessions:
-        // If ML Kit completes an utterance stream after silence, it automatically re-opens the PFD pipe.
+    private fun startMlKitLoop(recognizer: SpeechRecognizer, usePfdPipe: Boolean) {
         recognitionJob = mainScope.launch {
             while (keepSttRunning && isActive) {
                 try {
-                    closePipeOnly()
-                    val pipe = ParcelFileDescriptor.createPipe()
-                    pipeReadPfd = pipe[0]
-                    pipeWriteStream = ParcelFileDescriptor.AutoCloseOutputStream(pipe[1])
+                    val source = if (usePfdPipe) {
+                        closePipeOnly()
+                        val pipe = ParcelFileDescriptor.createPipe()
+                        pipeReadPfd = pipe[0]
+                        pipeWriteStream = ParcelFileDescriptor.AutoCloseOutputStream(pipe[1])
+                        AudioSource.fromPfd(pipeReadPfd!!, AudioSource.Mode.STREAMING)
+                    } else {
+                        AudioSource.fromMic()
+                    }
 
                     val request = speechRecognizerRequest {
-                        audioSource = AudioSource.fromPfd(pipeReadPfd!!, AudioSource.Mode.STREAMING)
+                        audioSource = source
                     }
 
                     recognizer.startRecognition(request).collect { response ->
@@ -266,19 +317,138 @@ class MainActivity : FlutterActivity() {
                                 }
                             }
 
+                            is SpeechRecognizerResponse.AudioLevelResponse -> {
+                                diarizer.processRmsFrame(response.rmsdB)
+                                emitRms(response.rmsdB)
+                            }
+
                             is SpeechRecognizerResponse.ErrorResponse -> {
-                                emitEvent("status", "ML Kit segment restarting (${response.e.message})...")
+                                emitEvent("status", "Reconnecting speech segment (${response.e.message})...")
                             }
 
                             else -> {}
                         }
                     }
                 } catch (_: Exception) {
-                    // Automatically restart segment if session is still running
+                    if (keepSttRunning && !usePfdPipe) {
+                        // Fall back to universal Android SpeechRecognizer if ML Kit stream errors
+                        startAndroidSpeechRecognizerLoop()
+                        return@launch
+                    }
                 }
                 if (keepSttRunning) {
-                    delay(250)
+                    delay(150)
                 }
+            }
+        }
+    }
+
+    /**
+     * Universal Android SpeechRecognizer continuous 60-minute hands-free loop.
+     * Automatically restarts within 80ms after each sentence or silence pause.
+     */
+    private fun startAndroidSpeechRecognizerLoop() {
+        mainHandler.post {
+            if (!keepSttRunning) return@post
+            try {
+                androidSpeechRecognizer?.destroy()
+            } catch (_: Exception) {}
+
+            val sr = AndroidSpeechRecognizer.createSpeechRecognizer(applicationContext)
+            androidSpeechRecognizer = sr
+
+            val recognizerIntent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                putExtra(
+                    RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                    RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
+                )
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
+                putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+                putExtra(
+                    RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS,
+                    2500L
+                )
+                putExtra(
+                    RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS,
+                    2000L
+                )
+            }
+
+            sr.setRecognitionListener(object : RecognitionListener {
+                override fun onReadyForSpeech(params: Bundle?) {
+                    emitEvent("status", "Listening hands-free (speak naturally)...")
+                }
+
+                override fun onBeginningOfSpeech() {}
+
+                override fun onRmsChanged(rmsdB: Float) {
+                    diarizer.processRmsFrame(rmsdB)
+                    emitRms(rmsdB)
+                }
+
+                override fun onBufferReceived(buffer: ByteArray?) {
+                    if (buffer != null && buffer.isNotEmpty()) {
+                        diarizer.processPcmChunk(buffer)
+                    }
+                }
+
+                override fun onEndOfSpeech() {}
+
+                override fun onError(error: Int) {
+                    if (!keepSttRunning) return
+                    // Automatically restart continuous listening on silence timeouts or segment end
+                    mainHandler.postDelayed({
+                        if (keepSttRunning) {
+                            try {
+                                sr.startListening(recognizerIntent)
+                            } catch (_: Exception) {
+                                startAndroidSpeechRecognizerLoop()
+                            }
+                        }
+                    }, 120L)
+                }
+
+                override fun onResults(results: Bundle?) {
+                    val matches = results?.getStringArrayList(AndroidSpeechRecognizer.RESULTS_RECOGNITION)
+                    val text = matches?.firstOrNull()?.trim() ?: ""
+                    if (text.isNotEmpty()) {
+                        val speaker = diarizer.finalizeUtteranceSpeaker()
+                        emitTranscript(text = text, speaker = speaker, isFinal = true)
+                    }
+                    if (keepSttRunning) {
+                        mainHandler.postDelayed({
+                            if (keepSttRunning) {
+                                try {
+                                    sr.startListening(recognizerIntent)
+                                } catch (_: Exception) {
+                                    startAndroidSpeechRecognizerLoop()
+                                }
+                            }
+                        }, 80L)
+                    }
+                }
+
+                override fun onPartialResults(partialResults: Bundle?) {
+                    val matches =
+                        partialResults?.getStringArrayList(AndroidSpeechRecognizer.RESULTS_RECOGNITION)
+                    val partial = matches?.firstOrNull()?.trim() ?: ""
+                    if (partial.isNotEmpty()) {
+                        emitTranscript(
+                            text = partial,
+                            speaker = diarizer.activeSpeakerLabel,
+                            isFinal = false
+                        )
+                    }
+                }
+
+                override fun onEvent(eventType: Int, params: Bundle?) {}
+            })
+
+            try {
+                sr.startListening(recognizerIntent)
+            } catch (e: Exception) {
+                emitEvent("error", "Mic recognition start error: ${e.message}")
             }
         }
     }
@@ -294,13 +464,28 @@ class MainActivity : FlutterActivity() {
         pipeReadPfd = null
     }
 
-    private fun stopMlKitStreamingStt() {
-        keepSttRunning = false
+    private fun stopRecognitionEnginesOnly() {
         recognitionJob?.cancel()
         recognitionJob = null
         closePipeOnly()
-        speechRecognizer?.close()
+        try {
+            speechRecognizer?.close()
+        } catch (_: Exception) {}
         speechRecognizer = null
+
+        mainHandler.post {
+            try {
+                androidSpeechRecognizer?.stopListening()
+                androidSpeechRecognizer?.cancel()
+                androidSpeechRecognizer?.destroy()
+            } catch (_: Exception) {}
+            androidSpeechRecognizer = null
+        }
+    }
+
+    private fun stopAllSttEngines() {
+        keepSttRunning = false
+        stopRecognitionEnginesOnly()
     }
 
     private suspend fun runMlKitOnDeviceSummarization(transcript: String): String {
@@ -322,9 +507,7 @@ class MainActivity : FlutterActivity() {
         }
 
         if (status == FeatureStatus.UNAVAILABLE) {
-            throw IllegalStateException(
-                "On-device Gemini Nano (AICore) Summarization is not supported on this phone model. Using Gemini Cloud Summary."
-            )
+            throw IllegalStateException("AICore Gemini Nano unavailable on this device")
         }
 
         if (status == FeatureStatus.DOWNLOADABLE) {
@@ -339,7 +522,6 @@ class MainActivity : FlutterActivity() {
             }
         }
 
-        // Support full 60-minute transcripts by summarizing 10,000-char windows and combining
         val chunkSize = 10000
         if (transcript.length <= chunkSize) {
             val req = SummarizationRequest.builder(transcript).build()
@@ -363,7 +545,7 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun emitTranscript(text: String, speaker: String, isFinal: Boolean) {
-        mainScope.launch(Dispatchers.Main) {
+        mainHandler.post {
             eventSink?.success(
                 mapOf(
                     "type" to "transcript",
@@ -375,8 +557,19 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    private fun emitRms(rmsdB: Float) {
+        mainHandler.post {
+            eventSink?.success(
+                mapOf(
+                    "type" to "rms",
+                    "rmsdB" to rmsdB.toDouble()
+                )
+            )
+        }
+    }
+
     private fun emitEvent(type: String, message: String) {
-        mainScope.launch(Dispatchers.Main) {
+        mainHandler.post {
             eventSink?.success(
                 mapOf(
                     "type" to type,
@@ -387,7 +580,7 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
-        stopMlKitStreamingStt()
+        stopAllSttEngines()
         summarizer?.close()
         audioTrack?.release()
         mainScope.cancel()
