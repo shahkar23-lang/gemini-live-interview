@@ -28,17 +28,26 @@ jobs:
           mkdir -p /tmp/backup/lib /tmp/backup/kotlin
           cp pubspec.yaml /tmp/backup/pubspec.yaml
           cp -r lib/* /tmp/backup/lib/
-          cp android/app/build.gradle.kts /tmp/backup/build.gradle.kts
           cp android/app/src/main/AndroidManifest.xml /tmp/backup/AndroidManifest.xml
           cp android/app/src/main/kotlin/com/example/gemini_live_interview/*.kt /tmp/backup/kotlin/
           rm -rf android
           flutter create --org com.example --project-name gemini_live_interview --platforms android .
           cp /tmp/backup/pubspec.yaml pubspec.yaml
           cp -r /tmp/backup/lib/* lib/
-          cp /tmp/backup/build.gradle.kts android/app/build.gradle.kts
           cp /tmp/backup/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
           mkdir -p android/app/src/main/kotlin/com/example/gemini_live_interview
           cp /tmp/backup/kotlin/*.kt android/app/src/main/kotlin/com/example/gemini_live_interview/
+          sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 26/g' android/app/build.gradle.kts
+          cat << 'EOF' >> android/app/build.gradle.kts
+
+          dependencies {
+              implementation("com.google.mlkit:genai-speech-recognition:1.0.0-alpha2")
+              implementation("com.google.mlkit:genai-summarization:1.0.0-beta1")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-guava:1.8.1")
+          }
+          EOF
+          cat android/app/build.gradle.kts
 
       - name: Install dependencies
         run: flutter pub get
