@@ -5,7 +5,7 @@ plugins {
 
 android {
     namespace = "com.example.gemini_live_interview"
-    compileSdk = 35
+    compileSdk = 37
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
