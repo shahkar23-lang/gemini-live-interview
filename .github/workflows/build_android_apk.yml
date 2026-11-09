@@ -1,0 +1,53 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Generate Android Gradle wrapper & resources and overlay custom ML Kit code
+        run: |
+          mkdir -p /tmp/backup/lib /tmp/backup/kotlin
+          cp pubspec.yaml /tmp/backup/pubspec.yaml
+          cp -r lib/* /tmp/backup/lib/
+          cp android/app/build.gradle.kts /tmp/backup/build.gradle.kts
+          cp android/app/src/main/AndroidManifest.xml /tmp/backup/AndroidManifest.xml
+          cp android/app/src/main/kotlin/com/example/gemini_live_interview/*.kt /tmp/backup/kotlin/
+          rm -rf android
+          flutter create --org com.example --project-name gemini_live_interview --platforms android .
+          cp /tmp/backup/pubspec.yaml pubspec.yaml
+          cp -r /tmp/backup/lib/* lib/
+          cp /tmp/backup/build.gradle.kts android/app/build.gradle.kts
+          cp /tmp/backup/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
+          mkdir -p android/app/src/main/kotlin/com/example/gemini_live_interview
+          cp /tmp/backup/kotlin/*.kt android/app/src/main/kotlin/com/example/gemini_live_interview/
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Build Release APK
+        run: flutter build apk --release
+
+      - name: Upload Release APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gemini-live-interview-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
