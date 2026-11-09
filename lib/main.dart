@@ -1,8 +1,6 @@
 import 'dart:async';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
-import 'package:flutter_pcm_sound/flutter_pcm_sound.dart';
-import 'package:permission_handler/permission_handler.dart';
 import 'package:record/record.dart';
 
 import 'models/interview_models.dart';
@@ -21,7 +19,7 @@ class GeminiInterviewApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Gemini Live Interview Studio',
+      title: 'Gemini Live 60-Min Interview Studio',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(
@@ -43,6 +41,8 @@ class InterviewHomePage extends StatefulWidget {
 }
 
 class _InterviewHomePageState extends State<InterviewHomePage> {
+  static const Duration _maxSessionDuration = Duration(minutes: 60);
+
   final _apiKeyController = TextEditingController(
     text: const String.fromEnvironment('GEMINI_API_KEY'),
   );
@@ -55,12 +55,14 @@ class _InterviewHomePageState extends State<InterviewHomePage> {
   StreamSubscription<Uint8List>? _micSub;
   StreamSubscription<MlKitEvent>? _mlKitSub;
   StreamSubscription<Uint8List>? _pcmOutSub;
+  Timer? _sessionTimer;
 
   final List<TranscriptEntry> _entries = [];
   Map<String, String> _speakerRoleLabels = {};
   String _livePartialText = '';
   String _activeDetectedSpeaker = 'Speaker 1';
-  String _statusBanner = 'Ready to start live interview';
+  String _statusBanner = 'Ready for up to 60-minute live interview';
+  Duration _elapsed = Duration.zero;
   bool _isStreaming = false;
   bool _isGeneratingSummary = false;
   bool _aiCoInterviewerEnabled = true;
@@ -68,14 +70,7 @@ class _InterviewHomePageState extends State<InterviewHomePage> {
   @override
   void initState() {
     super.initState();
-    _initPcmPlayer();
     _bindStreams();
-  }
-
-  Future<void> _initPcmPlayer() async {
-    // Gemini Live outputs 24kHz 16-bit mono PCM audio
-    await FlutterPcmSound.setup(sampleRate: 24000, channelCount: 1);
-    await FlutterPcmSound.setFeedThreshold(2400);
   }
 
   void _bindStreams() {
@@ -156,20 +151,14 @@ class _InterviewHomePageState extends State<InterviewHomePage> {
       });
     });
 
-    // 4. Play 24kHz PCM voice output from Gemini Live
+    // 4. Play 24kHz PCM voice output from Gemini Live via native Android AudioTrack
     _pcmOutSub = _geminiLive.pcm24kOutputStream.listen((Uint8List rawBytes) async {
-      final byteData = ByteData.sublistView(rawBytes);
-      final sampleCount = rawBytes.lengthInBytes ~/ 2;
-      final samples = List<int>.generate(
-        sampleCount,
-        (i) => byteData.getInt16(i * 2, Endian.little),
-      );
-      await FlutterPcmSound.feed(PcmArrayInt16.fromList(samples));
+      await _mlKitBridge.playModelPcm24k(rawBytes);
     });
 
     // 5. Handle barge-in interruption
     _geminiLive.onInterrupted.listen((_) async {
-      await FlutterPcmSound.setup(sampleRate: 24000, channelCount: 1);
+      await _mlKitBridge.clearModelAudio();
     });
 
     _geminiLive.statusStream.listen((s) {
@@ -177,17 +166,26 @@ class _InterviewHomePageState extends State<InterviewHomePage> {
     });
   }
 
+  String _formatDuration(Duration d) {
+    final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+    if (d.inHours > 0) {
+      return '60:00';
+    }
+    return '$m:$s';
+  }
+
   Future<void> _toggleSession() async {
     if (_isStreaming) {
-      await _stopSession();
+      await _stopSession(autoReached60Min: false);
     } else {
       await _startSession();
     }
   }
 
   Future<void> _startSession() async {
-    final micStatus = await Permission.microphone.request();
-    if (!micStatus.isGranted) {
+    final hasMic = await _recorder.hasPermission();
+    if (!hasMic) {
       setState(() => _statusBanner = 'Microphone permission is required.');
       return;
     }
@@ -203,12 +201,11 @@ class _InterviewHomePageState extends State<InterviewHomePage> {
         setState(() => _statusBanner = 'Cloud connect failed ($e) — running On-Device ML Kit only.');
       }
     } else {
-      setState(() => _statusBanner = 'No API key — running On-Device ML Kit + Diarizer offline.');
+      setState(() => _statusBanner = 'No API key — running 60-min On-Device ML Kit + Diarizer offline.');
     }
 
     await _mlKitBridge.startOnDeviceStt();
 
-    // Start single 16kHz 16-bit mono PCM mic capture and tee to BOTH Gemini Live & ML Kit PFD pipe
     const config = RecordConfig(
       encoder: AudioEncoder.pcm16bits,
       sampleRate: 16000,
@@ -223,20 +220,42 @@ class _InterviewHomePageState extends State<InterviewHomePage> {
       _mlKitBridge.feedPcmChunk(pcmChunk);
     });
 
+    _sessionTimer?.cancel();
+    _elapsed = Duration.zero;
+    _sessionTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted) return;
+      setState(() {
+        _elapsed += const Duration(seconds: 1);
+      });
+      if (_elapsed >= _maxSessionDuration) {
+        _stopSession(autoReached60Min: true);
+      }
+    });
+
     setState(() => _isStreaming = true);
   }
 
-  Future<void> _stopSession() async {
+  Future<void> _stopSession({required bool autoReached60Min}) async {
+    _sessionTimer?.cancel();
+    _sessionTimer = null;
     await _micSub?.cancel();
     _micSub = null;
     await _recorder.stop();
     await _mlKitBridge.stopOnDeviceStt();
     await _geminiLive.disconnect();
+
+    if (!mounted) return;
     setState(() {
       _isStreaming = false;
       _livePartialText = '';
-      _statusBanner = 'Interview paused. Tap Summarize to generate report.';
+      _statusBanner = autoReached60Min
+          ? '60-minute interview complete! Generating summary...'
+          : 'Interview paused (${_formatDuration(_elapsed)} elapsed). Tap Summarize for report.';
     });
+
+    if (autoReached60Min && _entries.isNotEmpty) {
+      await _generateSummary();
+    }
   }
 
   Future<void> _generateSummary() async {
@@ -290,7 +309,8 @@ class _InterviewHomePageState extends State<InterviewHomePage> {
           controller: controller,
           padding: const EdgeInsets.fromLTRB(20, 4, 20, 32),
           children: [
-            Text('Interview Summary Report', style: Theme.of(ctx).textTheme.headlineSmall),
+            Text('Interview Summary Report (${_formatDuration(_elapsed)})',
+                style: Theme.of(ctx).textTheme.headlineSmall),
             const SizedBox(height: 12),
             Card(
               child: Padding(
@@ -350,22 +370,37 @@ class _InterviewHomePageState extends State<InterviewHomePage> {
 
   @override
   void dispose() {
+    _sessionTimer?.cancel();
     _micSub?.cancel();
     _mlKitSub?.cancel();
     _pcmOutSub?.cancel();
     _recorder.dispose();
     _geminiLive.dispose();
-    FlutterPcmSound.release();
     _apiKeyController.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    final progress = (_elapsed.inSeconds / _maxSessionDuration.inSeconds).clamp(0.0, 1.0);
+
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Gemini Live + ML Kit Interview'),
+        title: const Text('Gemini Live + ML Kit (60m)'),
         actions: [
+          Center(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              child: Text(
+                '${_formatDuration(_elapsed)} / 60:00',
+                style: TextStyle(
+                  fontFeatures: const [FontFeature.tabularFigures()],
+                  fontWeight: FontWeight.bold,
+                  color: _isStreaming ? Colors.greenAccent : Colors.white70,
+                ),
+              ),
+            ),
+          ),
           IconButton(
             tooltip: 'Generate Interview Summary',
             onPressed: _isGeneratingSummary ? null : _generateSummary,
@@ -378,6 +413,10 @@ class _InterviewHomePageState extends State<InterviewHomePage> {
                 : const Icon(Icons.summarize_outlined),
           ),
         ],
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(3),
+          child: LinearProgressIndicator(value: progress),
+        ),
       ),
       body: Column(
         children: [
@@ -410,8 +449,9 @@ class _InterviewHomePageState extends State<InterviewHomePage> {
                     child: Padding(
                       padding: EdgeInsets.all(24),
                       child: Text(
-                        'Tap "Start Live Interview" to stream 16kHz audio to Gemini Live '
-                        'and on-device Android ML Kit with live speaker diarization.',
+                        'Tap "Start 60-Min Interview" to stream 16kHz audio to Gemini Live '
+                        '(with slidingWindow compression + sessionResumption) and on-device '
+                        'Android ML Kit with live speaker diarization.',
                         textAlign: TextAlign.center,
                       ),
                     ),
@@ -487,7 +527,7 @@ class _InterviewHomePageState extends State<InterviewHomePage> {
                       ),
                       onPressed: _toggleSession,
                       icon: Icon(_isStreaming ? Icons.stop_circle : Icons.mic),
-                      label: Text(_isStreaming ? 'Stop Live Interview' : 'Start Live Interview'),
+                      label: Text(_isStreaming ? 'Stop Live Interview' : 'Start 60-Min Interview'),
                     ),
                   ),
                   if (_isStreaming && _geminiLive.isConnected) ...[
